@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "webui",
+      "runtimeExecutable": ".venv/bin/python",
+      "runtimeArgs": ["webui.py", "--ip", "127.0.0.1", "--port", "7788"],
+      "port": 7788
+    }
+  ]
+}

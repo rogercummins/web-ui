@@ -36,6 +36,7 @@ from src.controller.custom_controller import CustomController
 from gradio.themes import Citrus, Default, Glass, Monochrome, Ocean, Origin, Soft, Base
 from src.utils.utils import update_model_dropdown, get_latest_files, capture_screenshot, MissingAPIKeyError
 from src.utils import utils
+from src.ui import build_api_config_tab, build_memory_tab
 
 # Global variables for persistence
 _global_browser = None
@@ -1136,6 +1137,12 @@ def create_ui(theme_name="Ocean"):
                     inputs=save_recording_path,
                     outputs=recordings_gallery
                 )
+
+            with gr.TabItem("🔌 API Config", id=9):
+                build_api_config_tab()
+
+            with gr.TabItem("🧠 Memory", id=10):
+                build_memory_tab()
 
             with gr.TabItem("📁 UI Configuration", id=8):
                 config_file_input = gr.File(
