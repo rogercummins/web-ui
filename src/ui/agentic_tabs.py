@@ -413,15 +413,20 @@ def build_memory_tab() -> None:
     # ---- memory handlers -------------------------------------------- #
     def do_add_memory(pid, title, mtype, tags, content):
         if not pid:
-            return gr.update(), [], _err("Pick a project first.")
+            return gr.update(), [], _err("Pick a project first."), gr.update()
         try:
             _memory_store.add_memory(pid, title=title or "", content=content or "",
                                      type=mtype, tags=_tags(tags))
             rows, ids = _memory_rows(pid)
-            return rows, ids, _ok("Memory added.")
+            # This repopulates the table via a plain per-project listing, not
+            # a rerun of whatever search was active — so last_query_state
+            # must drop back to None (see _refresh_memory_view), or the next
+            # Update/Delete would refresh by rerunning a search the table no
+            # longer reflects.
+            return rows, ids, _ok("Memory added."), None
         except HindsightError as exc:
             rows, ids = _memory_rows(pid)
-            return rows, ids, _err(str(exc))
+            return rows, ids, _err(str(exc)), None
 
     def do_update_memory(view_pid, sel, search_query, title, mtype, tags, content):
         if not sel:
@@ -499,7 +504,7 @@ def build_memory_tab() -> None:
                                   last_query_state])
     add_mem_btn.click(do_add_memory,
                       inputs=[project_dd, m_title, m_type, m_tags, m_content],
-                      outputs=[mem_table, mem_ids_state, mem_status])
+                      outputs=[mem_table, mem_ids_state, mem_status, last_query_state])
     update_mem_btn.click(do_update_memory,
                          inputs=[project_dd, sel_mem_state, last_query_state,
                                 m_title, m_type, m_tags, m_content],

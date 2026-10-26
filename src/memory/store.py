@@ -180,6 +180,17 @@ class HindsightStore:
             # it. Catch that here instead, at load time, so it's quarantined
             # like any other corrupt record rather than crashing a caller.
             self._safe_component(project.id, "id")
+            # A *safe but wrong* id (e.g. this project's file copied/edited
+            # under a different id, or a file hand-renamed into another
+            # project's directory) would otherwise load successfully but be
+            # permanently unreachable through that id: every lookup builds
+            # its path from the id, which would point elsewhere. Only an id
+            # matching the directory it was actually found in is usable.
+            on_disk_id = os.path.basename(os.path.dirname(path))
+            if project.id != on_disk_id:
+                raise ValidationError(
+                    "project record's id does not match its directory",
+                    detail=f"id={project.id!r} directory={on_disk_id!r}")
             return project
         except (json.JSONDecodeError, ValidationError, UnicodeDecodeError) as exc:
             qpath = self._quarantine(path, f"invalid project record: {exc}")
@@ -192,6 +203,11 @@ class HindsightStore:
             raw = self._read_json(path)
             memory = Memory.from_dict(raw)
             self._safe_component(memory.id, "id")
+            on_disk_id = os.path.splitext(os.path.basename(path))[0]
+            if memory.id != on_disk_id:
+                raise ValidationError(
+                    "memory record's id does not match its filename",
+                    detail=f"id={memory.id!r} filename={on_disk_id!r}")
             return memory
         except (json.JSONDecodeError, ValidationError, UnicodeDecodeError) as exc:
             qpath = self._quarantine(path, f"invalid memory record: {exc}")
