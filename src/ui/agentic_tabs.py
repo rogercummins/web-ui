@@ -18,15 +18,18 @@ from typing import List, Tuple
 
 import gradio as gr
 
-from src.config import ProviderStore, ProviderConfigError, SUPPORTED_PROVIDERS
-from src.memory import HindsightStore, HindsightError
+from src.config import ProviderConfigError, ProviderStore, SUPPORTED_PROVIDERS
+from src.memory import HindsightError, HindsightStore
 from src.memory.models import MEMORY_TYPES
+from src.qa import QAAgent, QAError
+from src.utils.utils import MissingAPIKeyError, get_llm_model
 
 logger = logging.getLogger(__name__)
 
 # Shared singletons (local, file-backed).
 _provider_store = ProviderStore()
 _memory_store = HindsightStore()
+_qa_agent = QAAgent(store=_memory_store)
 
 
 def _ok(msg: str) -> str:
@@ -375,3 +378,113 @@ def build_memory_tab() -> None:
                      outputs=[mem_table, mem_ids_state, mem_status])
     mem_table.select(on_mem_select, inputs=[project_dd, mem_ids_state],
                      outputs=[m_title, m_type, m_tags, m_content, sel_mem_state])
+
+
+# ====================================================================== #
+# Agentic Q&A tab
+# ====================================================================== #
+def _provider_choices_for_qa() -> List[Tuple[str, str]]:
+    out = [("(no LLM — extractive answers only)", "")]
+    try:
+        for p in _provider_store.list_profiles(public=True):
+            if p["enabled"] and p["has_key"]:
+                out.append((f"{p['label']}  ·  {p['provider']}", p["id"]))
+    except ProviderConfigError as exc:
+        logger.warning("listing provider profiles failed: %s", exc)
+    return out
+
+
+def _build_llm_for_profile(profile_id: str):
+    """Build a LangChain chat model for a provider profile, or None.
+
+    Any failure (missing key, bad config, unreachable endpoint) degrades to
+    "no LLM" rather than breaking the Q&A flow — the agent's extractive
+    fallback still answers correctly, just less fluently.
+    """
+    if not profile_id:
+        return None, ""
+    try:
+        profile = _provider_store.get_profile(profile_id)
+        api_key = _provider_store.get_secret(profile_id)
+        llm = get_llm_model(
+            profile.provider,
+            api_key=api_key,
+            base_url=profile.base_url or None,
+            model_name=profile.default_model or (profile.models[0] if profile.models else None),
+            temperature=0.0,
+        )
+        return llm, ""
+    except (ProviderConfigError, MissingAPIKeyError, HindsightError) as exc:
+        return None, _err(f"Could not build LLM from profile, using extractive "
+                          f"fallback instead: {exc}")
+    except Exception as exc:  # noqa: BLE001 - any provider SDK error
+        return None, _err(f"LLM provider error, using extractive fallback instead: {exc}")
+
+
+def build_qa_tab() -> None:
+    gr.Markdown(
+        "### 🤖 Agentic Q&A\n"
+        "Ask a question grounded in the Hindsight memory store. The agent "
+        "retrieves relevant memories, widens the search if the first pass is "
+        "weak, and only answers with explicit `[memory_id]` citations — if "
+        "nothing supports an answer, it says so instead of guessing."
+    )
+    with gr.Row():
+        qa_project_dd = gr.Dropdown(choices=_project_choices(), label="Project "
+                                    "(optional — searches all projects if empty)",
+                                    interactive=True)
+        qa_provider_dd = gr.Dropdown(choices=_provider_choices_for_qa(),
+                                     value="", label="LLM provider profile")
+        refresh_qa_btn = gr.Button("🔄 Refresh")
+
+    qa_question = gr.Textbox(label="Question", lines=2,
+                             placeholder="问一个这个知识库里的资料能回答的问题……")
+    ask_btn = gr.Button("💬 Ask", variant="primary")
+
+    qa_answer = gr.Textbox(label="Answer", lines=6, interactive=False)
+    with gr.Row():
+        qa_grounded = gr.Textbox(label="Grounded?", interactive=False, scale=1)
+        qa_rounds = gr.Textbox(label="Retrieval rounds", interactive=False, scale=1)
+    qa_sources = gr.Dataframe(
+        headers=["memory_id", "Title", "Score", "Project"],
+        datatype=["str", "str", "number", "str"],
+        interactive=False, label="Sources used / retrieved")
+    qa_status = gr.Textbox(label="Status", interactive=False, lines=2)
+
+    def do_refresh():
+        return (gr.update(choices=_project_choices()),
+                gr.update(choices=_provider_choices_for_qa()))
+
+    def do_ask(pid, profile_id, question):
+        if not (question or "").strip():
+            return "", "", "", [], _err("Type a question first.")
+
+        llm, llm_status = _build_llm_for_profile(profile_id)
+        try:
+            result = _qa_agent.ask(question, project_id=pid or None)
+        except QAError as exc:
+            return "", "", "", [], _err(str(exc))
+
+        # Swap in the resolved LLM for this call only, then run again if we
+        # built one successfully (the module-level agent defaults to the
+        # extractive fallback so it always works with zero configuration).
+        if llm is not None:
+            _qa_agent.llm = llm
+            try:
+                result = _qa_agent.ask(question, project_id=pid or None)
+            except QAError as exc:
+                return "", "", "", [], _err(str(exc))
+            finally:
+                _qa_agent.llm = None
+
+        rows = [[s.id, s.title, s.score, s.project_id] for s in result.sources]
+        grounded_label = "✅ yes" if result.grounded else "⚠️ refused (not grounded)"
+        status = _ok(f"{result.rounds_used} retrieval round(s), "
+                     f"{len(result.sources)} source(s).")
+        if llm_status:
+            status = f"{status}\n{llm_status}"
+        return result.answer, grounded_label, str(result.rounds_used), rows, status
+
+    refresh_qa_btn.click(do_refresh, outputs=[qa_project_dd, qa_provider_dd])
+    ask_btn.click(do_ask, inputs=[qa_project_dd, qa_provider_dd, qa_question],
+                 outputs=[qa_answer, qa_grounded, qa_rounds, qa_sources, qa_status])
