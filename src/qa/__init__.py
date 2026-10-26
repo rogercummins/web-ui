@@ -8,12 +8,7 @@ to the memories it used. If nothing in the store supports an answer, it says
 so instead of guessing.
 """
 
-from .exceptions import (
-    AnswerNotGroundedError,
-    EmptyKnowledgeBaseError,
-    QAError,
-    RetrievalError,
-)
+from .exceptions import QAError, RetrievalError
 from .agent import QAAgent, QAAnswer, QASource
 
 __all__ = [
@@ -22,6 +17,4 @@ __all__ = [
     "QASource",
     "QAError",
     "RetrievalError",
-    "EmptyKnowledgeBaseError",
-    "AnswerNotGroundedError",
 ]

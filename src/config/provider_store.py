@@ -45,6 +45,24 @@ class ProviderConfigError(Exception):
         return f"{self.message} ({self.detail})" if self.detail else self.message
 
 
+def build_llm_kwargs(profile: "ProviderProfile") -> Dict[str, Any]:
+    """kwargs for ``get_llm_model(profile.provider, **kwargs)`` from a profile.
+
+    Keys with no configured value are left out entirely rather than passed as
+    ``""``/``None`` — ``get_llm_model`` uses ``kwargs.get(key, <default>)``,
+    and an explicit ``""``/``None`` value defeats that default just as much
+    as a real one would, instead of letting the factory fall back to its own
+    per-provider default model/endpoint.
+    """
+    kwargs: Dict[str, Any] = {"api_key": profile.api_key, "temperature": 0.0}
+    model_name = profile.default_model or (profile.models[0] if profile.models else "")
+    if model_name:
+        kwargs["model_name"] = model_name
+    if profile.base_url:
+        kwargs["base_url"] = profile.base_url
+    return kwargs
+
+
 def _mask(secret: str) -> str:
     if not secret:
         return ""
@@ -75,6 +93,13 @@ class ProviderProfile:
             raise ProviderConfigError(
                 "unsupported provider type",
                 detail=f"{self.provider!r}; expected one of {', '.join(SUPPORTED_PROVIDERS)}")
+        # A malformed scalar here (e.g. a persisted record with api_key as a
+        # number) would otherwise only surface later as a crash in _mask()
+        # or the UI, well past the point where _load() could quarantine it.
+        for field_name in ("api_key", "base_url", "default_model"):
+            if not isinstance(getattr(self, field_name), str):
+                raise ProviderConfigError(f"'{field_name}' must be a string",
+                                          detail=f"got {type(getattr(self, field_name)).__name__}")
         if not isinstance(self.models, list) or any(not isinstance(m, str) for m in self.models):
             raise ProviderConfigError("models must be a list of strings")
         self.models = [m.strip() for m in self.models if m and m.strip()]
@@ -171,10 +196,18 @@ class ProviderStore:
 
     def _save(self) -> None:
         directory = os.path.dirname(self.path)
-        os.makedirs(directory, exist_ok=True)
         payload = {"version": 1,
                    "providers": [p.to_dict() for p in self._profiles.values()]}
-        fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
+        try:
+            os.makedirs(directory, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
+        except OSError as exc:
+            # Setup failures (can't create the directory / can't open a temp
+            # file) used to raise a bare OSError here, bypassing the
+            # ProviderConfigError hierarchy callers and the UI actually
+            # handle.
+            raise ProviderConfigError("could not prepare provider config storage",
+                                      detail=str(exc)) from exc
         try:
             # API keys are stored in this JSON document in the clear (no OS
             # keyring integration — out of scope for this store), so at
@@ -216,7 +249,15 @@ class ProviderStore:
                 base_url=base_url.strip(), models=models or [],
                 default_model=default_model.strip(), enabled=enabled)
             self._profiles[profile.id] = profile
-            self._save()
+            try:
+                self._save()
+            except ProviderConfigError:
+                # Keep the in-memory store consistent with what's actually on
+                # disk: a caller that saw this error and retries (or just
+                # lists profiles) must not see a profile that was never
+                # durably saved.
+                del self._profiles[profile.id]
+                raise
             return profile
 
     def get_profile(self, profile_id: str) -> ProviderProfile:
@@ -251,15 +292,23 @@ class ProviderStore:
             data["updated_at"] = time.time()
             updated = ProviderProfile.from_dict(data)  # re-validate
             self._profiles[profile_id] = updated
-            self._save()
+            try:
+                self._save()
+            except ProviderConfigError:
+                self._profiles[profile_id] = profile  # roll back to the pre-update record
+                raise
             return updated
 
     def delete_profile(self, profile_id: str) -> None:
         with self._lock:
             if profile_id not in self._profiles:
                 raise ProviderConfigError("profile not found", detail=profile_id)
-            del self._profiles[profile_id]
-            self._save()
+            removed = self._profiles.pop(profile_id)
+            try:
+                self._save()
+            except ProviderConfigError:
+                self._profiles[profile_id] = removed  # roll back the delete
+                raise
 
     def get_secret(self, profile_id: str) -> str:
         """Return the raw (unmasked) API key — for client construction only."""
@@ -279,12 +328,7 @@ class ProviderStore:
         profile = self.get_profile(profile_id)
         try:
             from src.utils import llm_provider  # local import to avoid a heavy import cycle
-            llm = llm_provider.get_llm_model(
-                profile.provider,
-                model_name=profile.default_model or (profile.models[0] if profile.models else ""),
-                api_key=profile.api_key,
-                base_url=profile.base_url,
-            )
+            llm = llm_provider.get_llm_model(profile.provider, **build_llm_kwargs(profile))
         except Exception as exc:  # noqa: BLE001 - surface as structured result
             return {"ok": False, "stage": "build", "error": str(exc)}
 

@@ -89,20 +89,22 @@ class Retriever:
 
     def retrieve(self, query: str, project_id: Optional[str] = None,
                  top_k: int = 5) -> List[QASource]:
+        top_k = max(0, top_k)
         q_tokens = tokenize(query)
-        if not q_tokens:
+        if not q_tokens or top_k == 0:
             return []
         q_set = set(meaningful_tokens(q_tokens))
+        needle = (query or "").strip().lower()
+
         try:
-            # Cast a wide net with the store's own substring search first —
-            # this keeps retrieval correct even for exact-phrase matches that
-            # the bag-of-tokens scorer below might under-weight — then fold
-            # in every other memory in scope so scoring can still surface
-            # partial token overlaps the substring search missed.
-            substring_hits = {m.id: m for m in self.store.search(query, project_id=project_id)}
+            # One pass over every in-scope memory: the exact-phrase
+            # substring check is computed inline against the same text
+            # already tokenized for scoring, rather than issuing a separate
+            # `store.search()` call that would re-list every project's
+            # memories from disk a second time.
             project_ids = ([project_id] if project_id
                            else [p.id for p in self.store.list_projects()])
-            pool: Dict[str, object] = dict(substring_hits)
+            pool: Dict[str, object] = {}
             for pid in project_ids:
                 try:
                     for mem in self.store.list_memories(pid):
@@ -115,19 +117,20 @@ class Retriever:
 
         scored: List[QASource] = []
         for mem in pool.values():
-            haystack_tokens = tokenize(f"{mem.title} {mem.content} {' '.join(mem.tags)}")
-            h_set = set(haystack_tokens)
+            full_text = f"{mem.title} {mem.content} {' '.join(mem.tags)}"
+            h_set = set(tokenize(full_text))
             if not h_set:
                 continue
             overlap = q_set & h_set
-            if not overlap:
+            is_substring_hit = bool(needle) and needle in full_text.lower()
+            if not overlap and not is_substring_hit:
                 continue
             # Overlap ratio against the query (recall-oriented) with a small
-            # title-match and substring-hit bonus.
+            # title-match and exact-phrase-hit bonus.
             score = len(overlap) / max(len(q_set), 1)
-            if any(t in tokenize(mem.title) for t in overlap):
+            if overlap and any(t in tokenize(mem.title) for t in overlap):
                 score += 0.25
-            if mem.id in substring_hits:
+            if is_substring_hit:
                 score += 0.5
             scored.append(QASource(id=mem.id, project_id=mem.project_id,
                                     title=mem.title, content=mem.content,

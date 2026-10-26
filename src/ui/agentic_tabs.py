@@ -22,6 +22,7 @@ from typing import List, Optional, Tuple
 import gradio as gr
 
 from src.config import ProviderConfigError, ProviderStore, SUPPORTED_PROVIDERS
+from src.config.provider_store import build_llm_kwargs
 from src.memory import HindsightError, HindsightStore
 from src.memory.models import MEMORY_TYPES
 from src.qa import QAAgent, QAError
@@ -110,7 +111,8 @@ def build_api_config_tab() -> None:
         "Manage LLM provider profiles — keys, endpoints and model lists — "
         "like Cursor's model settings. Keys are stored locally and shown masked."
     )
-    ids_state = gr.State([])
+    _initial_rows, _initial_ids = _provider_rows()
+    ids_state = gr.State(_initial_ids)
     selected_state = gr.State(None)
 
     with gr.Row():
@@ -118,6 +120,7 @@ def build_api_config_tab() -> None:
             provider_table = gr.Dataframe(
                 headers=["Label", "Provider", "Enabled", "Default model", "# Models", "API key"],
                 datatype=["str", "str", "str", "str", "number", "str"],
+                value=_initial_rows,
                 interactive=False,
                 label="Configured providers",
                 wrap=True,
@@ -181,19 +184,27 @@ def build_api_config_tab() -> None:
     def do_delete(selected):
         if not selected:
             rows, ids = _provider_rows()
-            return rows, ids, _err("Select a profile row first.")
+            return rows, ids, _err("Select a profile row first."), selected
         try:
             _provider_store.delete_profile(selected)
             rows, ids = _provider_rows()
-            return rows, ids, _ok("Profile deleted.")
+            # Clear the selection along with the row: leaving a deleted id in
+            # selected_state means Test/Update on the stale selection would
+            # fail against a profile that no longer exists.
+            return rows, ids, _ok("Profile deleted."), None
         except ProviderConfigError as exc:
             rows, ids = _provider_rows()
-            return rows, ids, _err(str(exc))
+            return rows, ids, _err(str(exc)), selected
 
     def do_test(selected):
         if not selected:
             return _err("Select a profile row first.")
-        result = _provider_store.test_profile(selected, live=False)
+        try:
+            result = _provider_store.test_profile(selected, live=False)
+        except ProviderConfigError as exc:
+            # e.g. the selected profile was deleted in another tab/session
+            # since it was selected here.
+            return _err(str(exc))
         if result.get("ok"):
             return _ok(result.get("message", "client built successfully."))
         return _err(f"[{result.get('stage')}] {result.get('error')}")
@@ -231,7 +242,7 @@ def build_api_config_tab() -> None:
     update_btn.click(do_update, inputs=[selected_state] + form,
                      outputs=[provider_table, ids_state, status])
     delete_btn.click(do_delete, inputs=[selected_state],
-                     outputs=[provider_table, ids_state, status])
+                     outputs=[provider_table, ids_state, status, selected_state])
     test_btn.click(do_test, inputs=[selected_state], outputs=[status])
     clear_btn.click(do_clear, outputs=form + [selected_state])
     provider_table.select(on_select, inputs=[ids_state], outputs=form + [selected_state])
@@ -250,7 +261,14 @@ def _project_choices() -> List[Tuple[str, str]]:
     return out
 
 
-def _memory_rows(project_id: str) -> Tuple[List[list], List[str]]:
+def _memory_rows(project_id: str) -> Tuple[List[list], List[Tuple[str, str]]]:
+    """Return (dataframe rows, parallel (project_id, memory_id) list).
+
+    Each id is paired with its own project_id (even though every row here
+    comes from the same project) so this list has the same shape as
+    ``do_search``'s, which can span projects — letting row-selection code
+    be project-agnostic either way.
+    """
     rows, ids = [], []
     if not project_id:
         return rows, ids
@@ -258,7 +276,7 @@ def _memory_rows(project_id: str) -> Tuple[List[list], List[str]]:
         for m in _memory_store.list_memories(project_id):
             rows.append([m.title, m.type, ", ".join(m.tags),
                          (m.content[:60] + "…") if len(m.content) > 60 else m.content])
-            ids.append(m.id)
+            ids.append((m.project_id, m.id))
     except HindsightError as exc:
         logger.warning("listing memories failed: %s", exc)
     return rows, ids
@@ -332,7 +350,11 @@ def build_memory_tab() -> None:
 
     def on_project_change(pid):
         rows, ids = _memory_rows(pid)
-        return rows, ids, _ok(f"{len(ids)} memories.") if pid else ""
+        # Clear the memory selection: a selected memory id from the previous
+        # project doesn't exist under this one, and leaving it in
+        # sel_mem_state means Update/Delete would submit it against the
+        # wrong (project_id, memory_id) pair and always fail.
+        return rows, ids, (_ok(f"{len(ids)} memories.") if pid else ""), None
 
     # ---- memory handlers -------------------------------------------- #
     def do_add_memory(pid, title, mtype, tags, content):
@@ -347,28 +369,35 @@ def build_memory_tab() -> None:
             rows, ids = _memory_rows(pid)
             return rows, ids, _err(str(exc))
 
-    def do_update_memory(pid, mid, title, mtype, tags, content):
-        if not (pid and mid):
+    def do_update_memory(view_pid, sel, title, mtype, tags, content):
+        if not sel:
             return gr.update(), [], _err("Select a memory row first.")
+        # Use the selected row's OWN project_id for the store call, not the
+        # dropdown's — a cross-project search result's project can differ
+        # from whatever project the dropdown happens to show, and using the
+        # dropdown's would silently update/delete the wrong (project,
+        # memory) pair (or just fail with "not found").
+        sel_pid, mid = sel
         try:
-            _memory_store.update_memory(pid, mid, title=title or "",
+            _memory_store.update_memory(sel_pid, mid, title=title or "",
                                         content=content or "", type=mtype,
                                         tags=_tags(tags))
-            rows, ids = _memory_rows(pid)
+            rows, ids = _memory_rows(view_pid)
             return rows, ids, _ok("Memory updated.")
         except HindsightError as exc:
-            rows, ids = _memory_rows(pid)
+            rows, ids = _memory_rows(view_pid)
             return rows, ids, _err(str(exc))
 
-    def do_delete_memory(pid, mid):
-        if not (pid and mid):
+    def do_delete_memory(view_pid, sel):
+        if not sel:
             return gr.update(), [], _err("Select a memory row first.")
+        sel_pid, mid = sel
         try:
-            _memory_store.delete_memory(pid, mid)
-            rows, ids = _memory_rows(pid)
+            _memory_store.delete_memory(sel_pid, mid)
+            rows, ids = _memory_rows(view_pid)
             return rows, ids, _ok("Memory deleted.")
         except HindsightError as exc:
-            rows, ids = _memory_rows(pid)
+            rows, ids = _memory_rows(view_pid)
             return rows, ids, _err(str(exc))
 
     def do_search(pid, query):
@@ -377,33 +406,39 @@ def build_memory_tab() -> None:
             rows = [[m.title, m.type, ", ".join(m.tags),
                      (m.content[:60] + "…") if len(m.content) > 60 else m.content]
                     for m in results]
-            ids = [m.id for m in results]
+            # Each result's OWN project_id — `search()` can span every
+            # project when `pid` is empty, and pairing every row with
+            # whatever `pid` is currently selected would make a cross-project
+            # match look selectable but actually open/update/delete the
+            # wrong project's memory.
+            ids = [(m.project_id, m.id) for m in results]
             return rows, ids, _ok(f"{len(ids)} match(es).")
         except HindsightError as exc:
             return gr.update(), [], _err(str(exc))
 
-    def on_mem_select(pid, ids, evt: gr.SelectData):
-        if not (pid and ids) or evt.index is None:
+    def on_mem_select(ids, evt: gr.SelectData):
+        if not ids or evt.index is None:
             return gr.update(), gr.update(), gr.update(), gr.update(), None
         row = evt.index[0] if isinstance(evt.index, (list, tuple)) else evt.index
         if row >= len(ids):
             return gr.update(), gr.update(), gr.update(), gr.update(), None
+        sel_pid, mid = ids[row]
         try:
-            m = _memory_store.get_memory(pid, ids[row])
+            m = _memory_store.get_memory(sel_pid, mid)
         except HindsightError:
             return gr.update(), gr.update(), gr.update(), gr.update(), None
         return (gr.update(value=m.title), gr.update(value=m.type),
                 gr.update(value=", ".join(m.tags)), gr.update(value=m.content),
-                m.id)
+                (sel_pid, mid))
 
     create_proj_btn.click(do_create_project, inputs=[new_proj_name, new_proj_desc],
                           outputs=[project_dd, mem_status, new_proj_name, new_proj_desc])
     del_proj_btn.click(do_delete_project, inputs=[project_dd],
                        outputs=[project_dd, mem_table, mem_ids_state, mem_status])
     project_dd.change(on_project_change, inputs=[project_dd],
-                      outputs=[mem_table, mem_ids_state, mem_status])
+                      outputs=[mem_table, mem_ids_state, mem_status, sel_mem_state])
     refresh_mem_btn.click(on_project_change, inputs=[project_dd],
-                          outputs=[mem_table, mem_ids_state, mem_status])
+                          outputs=[mem_table, mem_ids_state, mem_status, sel_mem_state])
     add_mem_btn.click(do_add_memory,
                       inputs=[project_dd, m_title, m_type, m_tags, m_content],
                       outputs=[mem_table, mem_ids_state, mem_status])
@@ -414,7 +449,7 @@ def build_memory_tab() -> None:
                       outputs=[mem_table, mem_ids_state, mem_status])
     search_btn.click(do_search, inputs=[project_dd, search_box],
                      outputs=[mem_table, mem_ids_state, mem_status])
-    mem_table.select(on_mem_select, inputs=[project_dd, mem_ids_state],
+    mem_table.select(on_mem_select, inputs=[mem_ids_state],
                      outputs=[m_title, m_type, m_tags, m_content, sel_mem_state])
 
 
@@ -425,7 +460,10 @@ def _provider_choices_for_qa() -> List[Tuple[str, str]]:
     out = [("(no LLM — extractive answers only)", "")]
     try:
         for p in _provider_store.list_profiles(public=True):
-            if p["enabled"] and p["has_key"]:
+            # Ollama is the one provider get_llm_model() doesn't require a
+            # key for (it's a local server), so it's selectable without one;
+            # every other provider still needs has_key.
+            if p["enabled"] and (p["has_key"] or p["provider"] == "ollama"):
                 out.append((f"{p['label']}  ·  {p['provider']}", p["id"]))
     except ProviderConfigError as exc:
         logger.warning("listing provider profiles failed: %s", exc)
@@ -443,14 +481,7 @@ def _build_llm_for_profile(profile_id: str):
         return None, ""
     try:
         profile = _provider_store.get_profile(profile_id)
-        api_key = _provider_store.get_secret(profile_id)
-        llm = get_llm_model(
-            profile.provider,
-            api_key=api_key,
-            base_url=profile.base_url or None,
-            model_name=profile.default_model or (profile.models[0] if profile.models else None),
-            temperature=0.0,
-        )
+        llm = get_llm_model(profile.provider, **build_llm_kwargs(profile))
         return llm, ""
     except (ProviderConfigError, ValueError, HindsightError) as exc:
         return None, _err(f"Could not build LLM from profile, using extractive "

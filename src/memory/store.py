@@ -34,6 +34,7 @@ from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 from .exceptions import (
     CorruptedRecordError,
+    DuplicateError,
     HindsightError,
     NotFoundError,
     StorageError,
@@ -199,8 +200,8 @@ class HindsightStore:
         with self._lock:
             path = self._project_file(project.id)
             if os.path.exists(path):  # vanishingly unlikely UUID clash
-                raise ValidationError("a project with this id already exists",
-                                      detail=project.id)
+                raise DuplicateError("a project with this id already exists",
+                                     detail=project.id)
             self._atomic_write(path, project.to_dict())
         return project
 

@@ -33,23 +33,8 @@ class RetrievalError(QAError):
 
     code = "retrieval_error"
 
-
-class EmptyKnowledgeBaseError(QAError):
-    """No project/memory in the store matched the question at all.
-
-    This is not a failure of the agent — it is a correct, explicit "I don't
-    know" outcome that must never be silently papered over with a guessed
-    answer.
-    """
-
-    code = "empty_knowledge_base"
-
-
-class AnswerNotGroundedError(QAError):
-    """A candidate answer could not be tied back to any retrieved source.
-
-    Raised internally by the groundedness check and turned into a refusal
-    answer rather than propagated to the caller as a hard failure.
-    """
-
-    code = "not_grounded"
+# Note: an empty knowledge base and a non-grounded candidate answer are NOT
+# QAError subclasses — QAAgent.ask() never raises for either. Both are
+# correct, successful outcomes ("I don't know", not "something broke"), so
+# they come back as a refusal QAAnswer (see agent.py's `_refusal`) rather
+# than an exception a caller would have to catch.

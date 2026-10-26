@@ -95,11 +95,14 @@ class Project:
     def from_dict(cls, data: Dict[str, Any]) -> "Project":
         if not isinstance(data, dict):
             raise ValidationError("project record must be an object")
+        if not data.get("id"):
+            raise ValidationError("project record is missing a required field",
+                                  detail="id")
         try:
             return cls(
                 name=data["name"],
                 description=data.get("description", ""),
-                id=data.get("id") or _new_id("proj"),
+                id=data["id"],
                 tags=data.get("tags", []),
                 created_at=data.get("created_at", _now()),
                 updated_at=data.get("updated_at", _now()),
@@ -153,13 +156,16 @@ class Memory:
     def from_dict(cls, data: Dict[str, Any]) -> "Memory":
         if not isinstance(data, dict):
             raise ValidationError("memory record must be an object")
+        if not data.get("id"):
+            raise ValidationError("memory record is missing a required field",
+                                  detail="id")
         try:
             return cls(
                 project_id=data["project_id"],
                 title=data["title"],
                 content=data.get("content", ""),
                 type=data.get("type", "note"),
-                id=data.get("id") or _new_id("mem"),
+                id=data["id"],
                 tags=data.get("tags", []),
                 created_at=data.get("created_at", _now()),
                 updated_at=data.get("updated_at", _now()),
