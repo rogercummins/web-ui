@@ -29,6 +29,7 @@ import shutil
 import tempfile
 import threading
 import time
+import uuid
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
 from .exceptions import (
@@ -93,7 +94,26 @@ class HindsightStore:
         os.makedirs(self.projects_dir, exist_ok=True)
         os.makedirs(self.quarantine_dir, exist_ok=True)
 
+    @staticmethod
+    def _safe_component(value: str, field_name: str) -> str:
+        """Reject anything that isn't a plain path segment.
+
+        ``project_id`` / ``memory_id`` end up directly in filesystem paths;
+        without this check a crafted id like ``"../../etc"`` or an absolute
+        path could read, overwrite, or (via ``delete_project``'s
+        ``shutil.rmtree``) recursively delete anything outside ``root``.
+        """
+        if (not isinstance(value, str) or not value
+                or value in (os.curdir, os.pardir)
+                or os.sep in value
+                or (os.altsep and os.altsep in value)
+                or value != os.path.basename(value)):
+            raise ValidationError(f"'{field_name}' is not a valid id",
+                                  detail=repr(value))
+        return value
+
     def _project_dir(self, project_id: str) -> str:
+        project_id = self._safe_component(project_id, "project_id")
         return os.path.join(self.projects_dir, project_id)
 
     def _project_file(self, project_id: str) -> str:
@@ -103,6 +123,7 @@ class HindsightStore:
         return os.path.join(self._project_dir(project_id), "memories")
 
     def _memory_file(self, project_id: str, memory_id: str) -> str:
+        memory_id = self._safe_component(memory_id, "memory_id")
         return os.path.join(self._memories_dir(project_id), f"{memory_id}.json")
 
     def _atomic_write(self, path: str, data: Dict[str, Any]) -> None:
@@ -128,7 +149,10 @@ class HindsightStore:
     def _quarantine(self, path: str, reason: str) -> str:
         """Move a bad file into ``.quarantine`` and return its new path."""
         stamp = time.strftime("%Y%m%d-%H%M%S")
-        base = f"{stamp}-{os.path.basename(path)}"
+        # A short random suffix keeps two records quarantined within the same
+        # second (same basename) from colliding and clobbering each other.
+        unique = uuid.uuid4().hex[:8]
+        base = f"{stamp}-{unique}-{os.path.basename(path)}"
         dest = os.path.join(self.quarantine_dir, base)
         try:
             shutil.move(path, dest)
@@ -358,7 +382,10 @@ class HindsightStore:
             project = self._load_project_record(path)
             project.updated_at = time.time()
             self._atomic_write(path, project.to_dict())
-        except HindsightError as exc:
+        except (HindsightError, OSError) as exc:
+            # Best-effort per the docstring: the memory write this follows
+            # already succeeded, so a failure here must never surface as a
+            # failure of that write.
             logger.warning("Could not bump project %s timestamp: %s", project_id, exc)
 
     @guard("compute store statistics")

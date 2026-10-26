@@ -6,15 +6,18 @@
   Hindsight :class:`HindsightStore` (projects + memories + search).
 
 Both are built *inside* an existing ``gr.Blocks`` context and own their event
-wiring. Each store is a module-level singleton so the tabs share one backend
-across the app's lifetime. Every handler funnels backend errors through
-``_err`` so a failure shows up as a red status line instead of a stack trace.
+wiring. Each store is a module-level singleton, built lazily on first use
+(see ``_ensure_stores``) so the tabs share one backend across the app's
+lifetime without being able to take down the rest of the WebUI at import
+time if local storage is unavailable. Every handler funnels backend errors
+through ``_err`` so a failure shows up as a red status line instead of a
+stack trace.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import gradio as gr
 
@@ -26,10 +29,37 @@ from src.utils.llm_provider import get_llm_model
 
 logger = logging.getLogger(__name__)
 
-# Shared singletons (local, file-backed).
-_provider_store = ProviderStore()
-_memory_store = HindsightStore()
-_qa_agent = QAAgent(store=_memory_store)
+# Shared singletons (local, file-backed), built lazily — see _ensure_stores().
+# Note: QAAgent is deliberately NOT a shared singleton — see do_ask()'s
+# comment — a fresh, request-local one is built per question instead, sharing
+# only the (stateless) store/retriever.
+_provider_store: Optional[ProviderStore] = None
+_memory_store: Optional[HindsightStore] = None
+_init_error: Optional[str] = None
+
+
+def _ensure_stores() -> bool:
+    """Lazily construct the shared stores on first use; returns readiness.
+
+    Building these eagerly at import time (as module-level singletons) meant
+    a read-only or otherwise unavailable ``./tmp`` directory would raise out
+    of the ``import src.ui`` that ``src/webui/interface.py`` does at startup,
+    taking down the *entire* WebUI (agent tabs included) over an optional
+    add-on. Deferring construction to the first time a tab actually renders
+    means that failure only disables these three tabs.
+    """
+    global _provider_store, _memory_store, _init_error
+    if _provider_store is not None and _memory_store is not None:
+        return True
+    try:
+        provider_store = _provider_store or ProviderStore()
+        memory_store = _memory_store or HindsightStore()
+    except Exception as exc:  # noqa: BLE001 - surface as a tab-level error, never crash startup
+        _init_error = str(exc)
+        logger.error("Could not initialize Agentic AI local storage: %s", exc)
+        return False
+    _provider_store, _memory_store = provider_store, memory_store
+    return True
 
 
 def _ok(msg: str) -> str:
@@ -71,6 +101,10 @@ def _split_models(text: str) -> List[str]:
 
 
 def build_api_config_tab() -> None:
+    if not _ensure_stores():
+        gr.Markdown(f"### 🔌 API Configuration\n⚠️ Unavailable: local storage for this "
+                   f"feature could not be initialized ({_init_error}).")
+        return
     gr.Markdown(
         "### 🔌 API Configuration\n"
         "Manage LLM provider profiles — keys, endpoints and model lists — "
@@ -231,6 +265,10 @@ def _memory_rows(project_id: str) -> Tuple[List[list], List[str]]:
 
 
 def build_memory_tab() -> None:
+    if not _ensure_stores():
+        gr.Markdown(f"### 🧠 Hindsight Memory\n⚠️ Unavailable: local storage for this "
+                   f"feature could not be initialized ({_init_error}).")
+        return
     gr.Markdown(
         "### 🧠 Hindsight Memory\n"
         "A local, file-based memory system (Codex-style): organize **memories** "
@@ -422,6 +460,10 @@ def _build_llm_for_profile(profile_id: str):
 
 
 def build_qa_tab() -> None:
+    if not _ensure_stores():
+        gr.Markdown(f"### 🤖 Agentic Q&A\n⚠️ Unavailable: local storage for this "
+                   f"feature could not be initialized ({_init_error}).")
+        return
     gr.Markdown(
         "### 🤖 Agentic Q&A\n"
         "Ask a question grounded in the Hindsight memory store. The agent "
@@ -460,22 +502,16 @@ def build_qa_tab() -> None:
             return "", "", "", [], _err("Type a question first.")
 
         llm, llm_status = _build_llm_for_profile(profile_id)
+        # A fresh, request-local agent per call: `_qa_agent` is a module-level
+        # singleton shared by every session, and mutating its `.llm` would be
+        # a race under concurrent questions (one request's provider choice
+        # could leak into another's answer). Reuse the shared store/retriever
+        # (cheap, stateless) but never the agent object itself.
+        agent = QAAgent(store=_memory_store, llm=llm)
         try:
-            result = _qa_agent.ask(question, project_id=pid or None)
+            result = agent.ask(question, project_id=pid or None)
         except QAError as exc:
             return "", "", "", [], _err(str(exc))
-
-        # Swap in the resolved LLM for this call only, then run again if we
-        # built one successfully (the module-level agent defaults to the
-        # extractive fallback so it always works with zero configuration).
-        if llm is not None:
-            _qa_agent.llm = llm
-            try:
-                result = _qa_agent.ask(question, project_id=pid or None)
-            except QAError as exc:
-                return "", "", "", [], _err(str(exc))
-            finally:
-                _qa_agent.llm = None
 
         rows = [[s.id, s.title, s.score, s.project_id] for s in result.sources]
         grounded_label = "✅ yes" if result.grounded else "⚠️ refused (not grounded)"

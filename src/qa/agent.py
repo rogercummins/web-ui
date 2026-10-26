@@ -19,19 +19,11 @@ from src.memory.exceptions import HindsightError
 from src.memory.store import HindsightStore
 
 from .exceptions import QAError, RetrievalError
-from .retriever import QASource, Retriever, tokenize
+from .retriever import STOPWORDS, QASource, Retriever, meaningful_tokens, tokenize
 
 logger = logging.getLogger(__name__)
 
 _CITATION_RE = re.compile(r"\[([A-Za-z0-9_]+)\]")
-
-# Low-content Chinese/English question particles stripped out when widening
-# a query on a second retrieval round, so round 2 searches on content words
-# rather than repeating the exact same (already-exhausted) query.
-_STOPWORDS = {
-    "什么", "是", "的", "吗", "呢", "如何", "怎么", "怎样", "为什么", "哪个", "哪些",
-    "what", "is", "are", "the", "a", "an", "how", "why", "does", "do", "to", "of",
-}
 
 
 class SupportsGenerate(Protocol):
@@ -95,6 +87,13 @@ class QAAgent:
     #: Minimum per-source overlap score to consider a retrieval "sufficient"
     #: evidence rather than a guess.
     MIN_SCORE = 0.2
+
+    #: Minimum fraction of the answer's own (non-stopword) tokens that must
+    #: also appear in the content of the sources it cites. A citation alone
+    #: proves nothing — a model can attach a real [memory_id] to a claim that
+    #: id's content never supports — so groundedness also requires the
+    #: answer text to actually overlap with what was cited.
+    MIN_CONTENT_SUPPORT = 0.3
 
     def __init__(self, store: Optional[HindsightStore] = None,
                  llm: Optional[SupportsGenerate] = None):
@@ -192,7 +191,7 @@ class QAAgent:
         returned weak evidence.
         """
         tokens = [t for t in tokenize(original_question)
-                 if t not in _STOPWORDS and len(t) > 1]
+                 if t not in STOPWORDS and len(t) > 1]
         if not tokens:
             return None
         widened = " ".join(dict.fromkeys(tokens))  # dedupe, preserve order
@@ -242,6 +241,12 @@ class QAAgent:
             if src.score < self.MIN_SCORE:
                 continue
             snippet = src.content.strip()
+            if not snippet:
+                # An empty-content memory has nothing to quote; citing it
+                # with no text would look like a grounded answer while
+                # actually asserting nothing. Let the no-citation refusal
+                # path handle this instead.
+                continue
             if len(snippet) > 600:
                 snippet = snippet[:600].rstrip() + "…"
             lines.append(f"{snippet} {src.citation_tag()}")
@@ -263,4 +268,24 @@ class QAAgent:
         unknown = [cid for cid in cited_ids if cid not in sources_by_id]
         if unknown:
             return False, f"答案引用了未被检索到的来源 {unknown},可能是编造的引用。"
+
+        # Citing a real id is necessary but not sufficient: verify the
+        # answer's own content actually overlaps with what the cited
+        # sources say, so an arbitrary claim glued to a real [memory_id]
+        # does not pass as grounded.
+        answer_tokens = meaningful_tokens(tokenize(_CITATION_RE.sub("", answer_text)))
+        if not answer_tokens:
+            return False, "答案除引用标记外没有可核实的内容。"
+        cited_content_tokens = set()
+        for cid in cited_ids:
+            src = sources_by_id.get(cid)
+            if src:
+                cited_content_tokens.update(tokenize(f"{src.title} {src.content}"))
+        supported = [t for t in answer_tokens if t in cited_content_tokens]
+        support_ratio = len(supported) / len(answer_tokens)
+        if support_ratio < self.MIN_CONTENT_SUPPORT:
+            return False, (
+                f"答案文本与其引用来源的内容重合度过低"
+                f"({support_ratio:.2f} < {self.MIN_CONTENT_SUPPORT}),"
+                f"引用可能与实际陈述的内容无关。")
         return True, ""

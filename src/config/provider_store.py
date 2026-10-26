@@ -147,6 +147,21 @@ class ProviderStore:
                 except OSError:
                     logger.error("Provider config unreadable and un-backupable: %s", exc)
                 return
+            if not isinstance(raw, dict) or not isinstance(raw.get("providers", []), list):
+                # Syntactically valid JSON (so the except above never ran)
+                # but not shaped like our document — e.g. a bare array or a
+                # `"providers"` that isn't a list. Treat it exactly like a
+                # corrupt file: back it up and start clean rather than
+                # crashing the whole store.
+                backup = f"{self.path}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}"
+                try:
+                    os.replace(self.path, backup)
+                    logger.error("Provider config has an unexpected shape, backed up to %s",
+                                 backup)
+                except OSError as exc:
+                    logger.error("Provider config has an unexpected shape and could not "
+                                 "be backed up: %s", exc)
+                return
             for record in raw.get("providers", []):
                 try:
                     profile = ProviderProfile.from_dict(record)
@@ -161,11 +176,23 @@ class ProviderStore:
                    "providers": [p.to_dict() for p in self._profiles.values()]}
         fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
         try:
+            # API keys are stored in this JSON document in the clear (no OS
+            # keyring integration — out of scope for this store), so at
+            # least restrict it to the owner. Best-effort: unsupported (e.g.
+            # Windows) or failing chmod must not block the save itself.
+            try:
+                os.chmod(tmp, 0o600)
+            except OSError:
+                pass
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(payload, fh, ensure_ascii=False, indent=2)
                 fh.flush()
                 os.fsync(fh.fileno())
             os.replace(tmp, self.path)
+            try:
+                os.chmod(self.path, 0o600)
+            except OSError:
+                pass
         except OSError as exc:
             try:
                 os.unlink(tmp)
@@ -216,6 +243,11 @@ class ProviderStore:
                 if key == "api_key" and value == "":
                     continue
                 data[key] = value
+            new_label = (data.get("label") or "").strip()
+            if any(pid != profile_id and p.label == new_label
+                  for pid, p in self._profiles.items()):
+                raise ProviderConfigError("a profile with this label already exists",
+                                          detail=new_label)
             data["updated_at"] = time.time()
             updated = ProviderProfile.from_dict(data)  # re-validate
             self._profiles[profile_id] = updated
@@ -246,8 +278,8 @@ class ProviderStore:
         """
         profile = self.get_profile(profile_id)
         try:
-            from src.utils import utils  # local import to avoid a heavy import cycle
-            llm = utils.get_llm_model(
+            from src.utils import llm_provider  # local import to avoid a heavy import cycle
+            llm = llm_provider.get_llm_model(
                 profile.provider,
                 model_name=profile.default_model or (profile.models[0] if profile.models else ""),
                 api_key=profile.api_key,

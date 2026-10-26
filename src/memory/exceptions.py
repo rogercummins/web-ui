@@ -24,6 +24,14 @@ class HindsightError(Exception):
         self.detail = detail
 
     def __str__(self) -> str:  # pragma: no cover - trivial
+        # `detail` can carry a raw OSError/traceback string from `guard`, and
+        # this is what UI code shows to the end user (see src/ui/agentic_tabs
+        # .py) — so __str__ stays to the stable message only. `detail` is
+        # still there on the exception object for logging.
+        return self.message
+
+    def log_str(self) -> str:
+        """Full text including the low-level `detail`, for server-side logs."""
         if self.detail:
             return f"{self.message} ({self.detail})"
         return self.message

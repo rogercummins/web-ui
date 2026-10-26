@@ -7,6 +7,7 @@ validation on construction, so a malformed file on disk surfaces as a
 
 from __future__ import annotations
 
+import math
 import time
 import uuid
 from dataclasses import dataclass, field, asdict
@@ -33,6 +34,16 @@ def _require_str(value: Any, field_name: str, *, allow_empty: bool = False) -> s
     if not allow_empty and not value.strip():
         raise ValidationError(f"'{field_name}' must not be empty")
     return value
+
+
+def _require_timestamp(value: Any, field_name: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValidationError(f"'{field_name}' must be a number",
+                              detail=f"got {type(value).__name__}")
+    if not math.isfinite(value):
+        raise ValidationError(f"'{field_name}' must be a finite number",
+                              detail=repr(value))
+    return float(value)
 
 
 def _coerce_tags(value: Any) -> List[str]:
@@ -71,8 +82,11 @@ class Project:
         _require_str(self.description, "description", allow_empty=True)
         _require_str(self.id, "id")
         self.tags = _coerce_tags(self.tags)
+        self.created_at = _require_timestamp(self.created_at, "created_at")
+        self.updated_at = _require_timestamp(self.updated_at, "updated_at")
         if not isinstance(self.metadata, dict):
-            raise ValidationError("'metadata' must be an object")
+            raise ValidationError("'metadata' must be an object",
+                                  detail=f"got {type(self.metadata).__name__}")
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -87,14 +101,14 @@ class Project:
                 description=data.get("description", ""),
                 id=data.get("id") or _new_id("proj"),
                 tags=data.get("tags", []),
-                created_at=float(data.get("created_at", _now())),
-                updated_at=float(data.get("updated_at", _now())),
-                metadata=data.get("metadata", {}) or {},
+                created_at=data.get("created_at", _now()),
+                updated_at=data.get("updated_at", _now()),
+                metadata=data.get("metadata", {}),
             )
         except KeyError as exc:
             raise ValidationError("project record is missing a required field",
                                   detail=str(exc)) from exc
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ValidationError("project record has an invalid field",
                                   detail=str(exc)) from exc
 
@@ -123,8 +137,11 @@ class Memory:
                 f"'type' must be one of {', '.join(MEMORY_TYPES)}",
                 detail=f"got {self.type!r}")
         self.tags = _coerce_tags(self.tags)
+        self.created_at = _require_timestamp(self.created_at, "created_at")
+        self.updated_at = _require_timestamp(self.updated_at, "updated_at")
         if not isinstance(self.metadata, dict):
-            raise ValidationError("'metadata' must be an object")
+            raise ValidationError("'metadata' must be an object",
+                                  detail=f"got {type(self.metadata).__name__}")
 
     def touch(self) -> None:
         self.updated_at = _now()
@@ -144,13 +161,13 @@ class Memory:
                 type=data.get("type", "note"),
                 id=data.get("id") or _new_id("mem"),
                 tags=data.get("tags", []),
-                created_at=float(data.get("created_at", _now())),
-                updated_at=float(data.get("updated_at", _now())),
-                metadata=data.get("metadata", {}) or {},
+                created_at=data.get("created_at", _now()),
+                updated_at=data.get("updated_at", _now()),
+                metadata=data.get("metadata", {}),
             )
         except KeyError as exc:
             raise ValidationError("memory record is missing a required field",
                                   detail=str(exc)) from exc
-        except (TypeError, ValueError) as exc:
+        except (TypeError, ValueError, OverflowError) as exc:
             raise ValidationError("memory record has an invalid field",
                                   detail=str(exc)) from exc

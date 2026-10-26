@@ -20,6 +20,26 @@ from .exceptions import RetrievalError
 _LATIN_TOKEN_RE = re.compile(r"[A-Za-z0-9_]+")
 _CJK_RE = re.compile(r"[一-鿿]+")
 
+# Low-content Chinese/English question particles. Shared by the retriever's
+# scoring (they must not count as retrieval evidence — a question that is
+# nothing but "什么是" + a term the KB doesn't have would otherwise still
+# score high enough to pass MIN_SCORE) and by the agent's query-widening.
+STOPWORDS = {
+    "什么", "是", "的", "吗", "呢", "如何", "怎么", "怎样", "为什么", "哪个", "哪些",
+    "what", "is", "are", "the", "a", "an", "how", "why", "does", "do", "to", "of",
+}
+
+
+def meaningful_tokens(tokens: List[str]) -> List[str]:
+    """Drop stopwords, but never return an empty list for a non-empty input.
+
+    A query that happens to be made entirely of stopwords (e.g. a bare "是
+    什么") still needs *something* to score against, so it falls back to the
+    original tokens rather than making every retrieval score zero.
+    """
+    filtered = [t for t in tokens if t not in STOPWORDS]
+    return filtered or list(tokens)
+
 
 def tokenize(text: str) -> List[str]:
     """Split text into lowercase Latin word tokens plus CJK bigrams.
@@ -72,7 +92,7 @@ class Retriever:
         q_tokens = tokenize(query)
         if not q_tokens:
             return []
-        q_set = set(q_tokens)
+        q_set = set(meaningful_tokens(q_tokens))
         try:
             # Cast a wide net with the store's own substring search first —
             # this keeps retrieval correct even for exact-phrase matches that
@@ -95,7 +115,7 @@ class Retriever:
 
         scored: List[QASource] = []
         for mem in pool.values():
-            haystack_tokens = tokenize(f"{mem.title} {mem.content}")
+            haystack_tokens = tokenize(f"{mem.title} {mem.content} {' '.join(mem.tags)}")
             h_set = set(haystack_tokens)
             if not h_set:
                 continue
