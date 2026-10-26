@@ -22,7 +22,7 @@ from src.config import ProviderConfigError, ProviderStore, SUPPORTED_PROVIDERS
 from src.memory import HindsightError, HindsightStore
 from src.memory.models import MEMORY_TYPES
 from src.qa import QAAgent, QAError
-from src.utils.utils import MissingAPIKeyError, get_llm_model
+from src.utils.llm_provider import get_llm_model
 
 logger = logging.getLogger(__name__)
 
@@ -414,7 +414,7 @@ def _build_llm_for_profile(profile_id: str):
             temperature=0.0,
         )
         return llm, ""
-    except (ProviderConfigError, MissingAPIKeyError, HindsightError) as exc:
+    except (ProviderConfigError, ValueError, HindsightError) as exc:
         return None, _err(f"Could not build LLM from profile, using extractive "
                           f"fallback instead: {exc}")
     except Exception as exc:  # noqa: BLE001 - any provider SDK error

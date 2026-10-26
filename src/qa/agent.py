@@ -86,7 +86,7 @@ class QAAgent:
     """Retrieval-augmented Q&A agent over a :class:`HindsightStore`.
 
     ``llm`` is optional: anything exposing ``.invoke(prompt) -> str`` (e.g. a
-    LangChain chat model from ``src.utils.utils.get_llm_model``). Without one,
+    LangChain chat model from ``src.utils.llm_provider.get_llm_model``). Without one,
     the agent still answers, but only by *extracting* the top-scoring source
     verbatim rather than synthesizing free text — correctness takes priority
     over fluency when there is no model to check its own citations.
