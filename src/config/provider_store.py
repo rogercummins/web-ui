@@ -164,7 +164,10 @@ class ProviderStore:
                     raw = json.load(fh)
             except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
                 # Corrupt config: back it up instead of losing it, start clean.
-                backup = f"{self.path}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}"
+                # A random suffix (not just the timestamp) keeps two
+                # recoveries within the same second from overwriting each
+                # other's backup.
+                backup = f"{self.path}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
                 try:
                     os.replace(self.path, backup)
                     logger.error("Provider config unreadable, backed up to %s: %s",
@@ -178,7 +181,10 @@ class ProviderStore:
                 # `"providers"` that isn't a list. Treat it exactly like a
                 # corrupt file: back it up and start clean rather than
                 # crashing the whole store.
-                backup = f"{self.path}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}"
+                # A random suffix (not just the timestamp) keeps two
+                # recoveries within the same second from overwriting each
+                # other's backup.
+                backup = f"{self.path}.corrupt-{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
                 try:
                     os.replace(self.path, backup)
                     logger.error("Provider config has an unexpected shape, backed up to %s",

@@ -171,7 +171,16 @@ class HindsightStore:
         """Read + parse one project file, quarantining it if it is corrupt."""
         try:
             raw = self._read_json(path)
-            return Project.from_dict(raw)
+            project = Project.from_dict(raw)
+            # A record whose *content* carries a path-like id (as opposed to
+            # a bad filename, already rejected in _project_dir) would
+            # otherwise pass from_dict's validation — it doesn't check id
+            # shape — and only fail later, as an uncaught ValidationError
+            # out of whatever store method next tries to build a path from
+            # it. Catch that here instead, at load time, so it's quarantined
+            # like any other corrupt record rather than crashing a caller.
+            self._safe_component(project.id, "id")
+            return project
         except (json.JSONDecodeError, ValidationError, UnicodeDecodeError) as exc:
             qpath = self._quarantine(path, f"invalid project record: {exc}")
             raise CorruptedRecordError(
@@ -181,7 +190,9 @@ class HindsightStore:
     def _load_memory_record(self, path: str) -> Memory:
         try:
             raw = self._read_json(path)
-            return Memory.from_dict(raw)
+            memory = Memory.from_dict(raw)
+            self._safe_component(memory.id, "id")
+            return memory
         except (json.JSONDecodeError, ValidationError, UnicodeDecodeError) as exc:
             qpath = self._quarantine(path, f"invalid memory record: {exc}")
             raise CorruptedRecordError(

@@ -6,11 +6,13 @@
   Hindsight :class:`HindsightStore` (projects + memories + search).
 
 Both are built *inside* an existing ``gr.Blocks`` context and own their event
-wiring. Each store is a module-level singleton, built lazily on first use
-(see ``_ensure_stores``) so the tabs share one backend across the app's
-lifetime without being able to take down the rest of the WebUI at import
-time if local storage is unavailable. Every handler funnels backend errors
-through ``_err`` so a failure shows up as a red status line instead of a
+wiring. Each store is a module-level singleton, built lazily and
+independently of the other on first use (see ``_ensure_provider_store`` /
+``_ensure_memory_store``) so the tabs share one backend across the app's
+lifetime without being able to take down the rest of the WebUI — or each
+other's tab — at import time if local storage is unavailable. Every handler
+funnels backend errors through ``_err`` so a failure shows up as a red
+status line instead of a
 stack trace.
 """
 
@@ -30,36 +32,59 @@ from src.utils.llm_provider import get_llm_model
 
 logger = logging.getLogger(__name__)
 
-# Shared singletons (local, file-backed), built lazily — see _ensure_stores().
-# Note: QAAgent is deliberately NOT a shared singleton — see do_ask()'s
-# comment — a fresh, request-local one is built per question instead, sharing
-# only the (stateless) store/retriever.
+# Shared singletons (local, file-backed), built lazily and INDEPENDENTLY —
+# see _ensure_provider_store() / _ensure_memory_store(). Note: QAAgent is
+# deliberately NOT a shared singleton — see do_ask()'s comment — a fresh,
+# request-local one is built per question instead, sharing only the
+# (stateless) store/retriever.
 _provider_store: Optional[ProviderStore] = None
 _memory_store: Optional[HindsightStore] = None
-_init_error: Optional[str] = None
+_provider_init_error: Optional[str] = None
+_memory_init_error: Optional[str] = None
 
 
-def _ensure_stores() -> bool:
-    """Lazily construct the shared stores on first use; returns readiness.
+def _ensure_provider_store() -> bool:
+    """Lazily construct the provider store on first use; returns readiness.
 
     Building these eagerly at import time (as module-level singletons) meant
     a read-only or otherwise unavailable ``./tmp`` directory would raise out
     of the ``import src.ui`` that ``src/webui/interface.py`` does at startup,
     taking down the *entire* WebUI (agent tabs included) over an optional
     add-on. Deferring construction to the first time a tab actually renders
-    means that failure only disables these three tabs.
+    means that failure only disables the tab(s) that need it — and since a
+    failure here leaves ``_provider_store`` as ``None`` rather than caching a
+    permanent error, simply opening a tab again (e.g. switching away and
+    back) retries construction for free.
+
+    The provider store and the memory store are intentionally independent:
+    an unavailable Hindsight directory must not also disable the unrelated
+    API Config tab, and vice versa.
     """
-    global _provider_store, _memory_store, _init_error
-    if _provider_store is not None and _memory_store is not None:
+    global _provider_store, _provider_init_error
+    if _provider_store is not None:
         return True
     try:
-        provider_store = _provider_store or ProviderStore()
-        memory_store = _memory_store or HindsightStore()
+        _provider_store = ProviderStore()
     except Exception as exc:  # noqa: BLE001 - surface as a tab-level error, never crash startup
-        _init_error = str(exc)
-        logger.error("Could not initialize Agentic AI local storage: %s", exc)
+        _provider_init_error = str(exc)
+        logger.error("Could not initialize the provider store: %s", exc)
         return False
-    _provider_store, _memory_store = provider_store, memory_store
+    return True
+
+
+def _ensure_memory_store() -> bool:
+    """Lazily construct the Hindsight memory store on first use. See
+    :func:`_ensure_provider_store` for why this is lazy, independent of the
+    provider store, and self-retrying."""
+    global _memory_store, _memory_init_error
+    if _memory_store is not None:
+        return True
+    try:
+        _memory_store = HindsightStore()
+    except Exception as exc:  # noqa: BLE001 - surface as a tab-level error, never crash startup
+        _memory_init_error = str(exc)
+        logger.error("Could not initialize the Hindsight memory store: %s", exc)
+        return False
     return True
 
 
@@ -102,9 +127,9 @@ def _split_models(text: str) -> List[str]:
 
 
 def build_api_config_tab() -> None:
-    if not _ensure_stores():
+    if not _ensure_provider_store():
         gr.Markdown(f"### 🔌 API Configuration\n⚠️ Unavailable: local storage for this "
-                   f"feature could not be initialized ({_init_error}).")
+                   f"feature could not be initialized ({_provider_init_error}).")
         return
     gr.Markdown(
         "### 🔌 API Configuration\n"
@@ -283,9 +308,9 @@ def _memory_rows(project_id: str) -> Tuple[List[list], List[Tuple[str, str]]]:
 
 
 def build_memory_tab() -> None:
-    if not _ensure_stores():
+    if not _ensure_memory_store():
         gr.Markdown(f"### 🧠 Hindsight Memory\n⚠️ Unavailable: local storage for this "
-                   f"feature could not be initialized ({_init_error}).")
+                   f"feature could not be initialized ({_memory_init_error}).")
         return
     gr.Markdown(
         "### 🧠 Hindsight Memory\n"
@@ -294,6 +319,13 @@ def build_memory_tab() -> None:
     )
     mem_ids_state = gr.State([])
     sel_mem_state = gr.State(None)
+    # The query behind whatever is currently in mem_table — "" means "the
+    # dropdown's project, unfiltered". Needed so Update/Delete can refresh
+    # the table the same way it was populated: a cross-project search result
+    # can't be refreshed with `_memory_rows(view_pid)` when view_pid is empty
+    # (that call returns nothing for an empty project id), so it reruns the
+    # same search instead.
+    last_query_state = gr.State("")
 
     with gr.Row():
         project_dd = gr.Dropdown(choices=_project_choices(), label="Project",
@@ -348,13 +380,35 @@ def build_memory_tab() -> None:
         except HindsightError as exc:
             return gr.update(), [], [], _err(str(exc))
 
+    def _refresh_memory_view(view_pid, search_query):
+        """Rebuild (rows, ids) the same way the table currently got them.
+
+        ``search_query`` is ``None`` when the table is showing a plain
+        per-project listing (``_memory_rows`` is correct and cheap), or a
+        string — possibly "" — when it's showing search results, which can
+        span every project. In that case ``_memory_rows(view_pid)`` would
+        return nothing at all for an empty ``view_pid`` (an all-project
+        search), so the same search is rerun instead.
+        """
+        if search_query is not None:
+            try:
+                results = _memory_store.search(search_query, project_id=view_pid or None)
+                rows = [[m.title, m.type, ", ".join(m.tags),
+                         (m.content[:60] + "…") if len(m.content) > 60 else m.content]
+                        for m in results]
+                ids = [(m.project_id, m.id) for m in results]
+                return rows, ids
+            except HindsightError as exc:
+                logger.warning("re-running search to refresh the table failed: %s", exc)
+                return [], []
+        return _memory_rows(view_pid)
+
     def on_project_change(pid):
         rows, ids = _memory_rows(pid)
-        # Clear the memory selection: a selected memory id from the previous
-        # project doesn't exist under this one, and leaving it in
-        # sel_mem_state means Update/Delete would submit it against the
-        # wrong (project_id, memory_id) pair and always fail.
-        return rows, ids, (_ok(f"{len(ids)} memories.") if pid else ""), None
+        # Clear the memory selection (see do_update_memory's comment) and
+        # drop back to "plain listing" mode: whatever was in the search box
+        # no longer describes what's on screen.
+        return rows, ids, (_ok(f"{len(ids)} memories.") if pid else ""), None, None
 
     # ---- memory handlers -------------------------------------------- #
     def do_add_memory(pid, title, mtype, tags, content):
@@ -369,7 +423,7 @@ def build_memory_tab() -> None:
             rows, ids = _memory_rows(pid)
             return rows, ids, _err(str(exc))
 
-    def do_update_memory(view_pid, sel, title, mtype, tags, content):
+    def do_update_memory(view_pid, sel, search_query, title, mtype, tags, content):
         if not sel:
             return gr.update(), [], _err("Select a memory row first.")
         # Use the selected row's OWN project_id for the store call, not the
@@ -382,22 +436,22 @@ def build_memory_tab() -> None:
             _memory_store.update_memory(sel_pid, mid, title=title or "",
                                         content=content or "", type=mtype,
                                         tags=_tags(tags))
-            rows, ids = _memory_rows(view_pid)
+            rows, ids = _refresh_memory_view(view_pid, search_query)
             return rows, ids, _ok("Memory updated.")
         except HindsightError as exc:
-            rows, ids = _memory_rows(view_pid)
+            rows, ids = _refresh_memory_view(view_pid, search_query)
             return rows, ids, _err(str(exc))
 
-    def do_delete_memory(view_pid, sel):
+    def do_delete_memory(view_pid, sel, search_query):
         if not sel:
             return gr.update(), [], _err("Select a memory row first.")
         sel_pid, mid = sel
         try:
             _memory_store.delete_memory(sel_pid, mid)
-            rows, ids = _memory_rows(view_pid)
+            rows, ids = _refresh_memory_view(view_pid, search_query)
             return rows, ids, _ok("Memory deleted.")
         except HindsightError as exc:
-            rows, ids = _memory_rows(view_pid)
+            rows, ids = _refresh_memory_view(view_pid, search_query)
             return rows, ids, _err(str(exc))
 
     def do_search(pid, query):
@@ -412,9 +466,11 @@ def build_memory_tab() -> None:
             # match look selectable but actually open/update/delete the
             # wrong project's memory.
             ids = [(m.project_id, m.id) for m in results]
-            return rows, ids, _ok(f"{len(ids)} match(es).")
+            # Remember this query (even "") so Update/Delete know to refresh
+            # by rerunning the search, not by listing a single project.
+            return rows, ids, _ok(f"{len(ids)} match(es)."), (query or "")
         except HindsightError as exc:
-            return gr.update(), [], _err(str(exc))
+            return gr.update(), [], _err(str(exc)), gr.update()
 
     def on_mem_select(ids, evt: gr.SelectData):
         if not ids or evt.index is None:
@@ -436,19 +492,22 @@ def build_memory_tab() -> None:
     del_proj_btn.click(do_delete_project, inputs=[project_dd],
                        outputs=[project_dd, mem_table, mem_ids_state, mem_status])
     project_dd.change(on_project_change, inputs=[project_dd],
-                      outputs=[mem_table, mem_ids_state, mem_status, sel_mem_state])
+                      outputs=[mem_table, mem_ids_state, mem_status, sel_mem_state,
+                              last_query_state])
     refresh_mem_btn.click(on_project_change, inputs=[project_dd],
-                          outputs=[mem_table, mem_ids_state, mem_status, sel_mem_state])
+                          outputs=[mem_table, mem_ids_state, mem_status, sel_mem_state,
+                                  last_query_state])
     add_mem_btn.click(do_add_memory,
                       inputs=[project_dd, m_title, m_type, m_tags, m_content],
                       outputs=[mem_table, mem_ids_state, mem_status])
     update_mem_btn.click(do_update_memory,
-                         inputs=[project_dd, sel_mem_state, m_title, m_type, m_tags, m_content],
+                         inputs=[project_dd, sel_mem_state, last_query_state,
+                                m_title, m_type, m_tags, m_content],
                          outputs=[mem_table, mem_ids_state, mem_status])
-    del_mem_btn.click(do_delete_memory, inputs=[project_dd, sel_mem_state],
+    del_mem_btn.click(do_delete_memory, inputs=[project_dd, sel_mem_state, last_query_state],
                       outputs=[mem_table, mem_ids_state, mem_status])
     search_btn.click(do_search, inputs=[project_dd, search_box],
-                     outputs=[mem_table, mem_ids_state, mem_status])
+                     outputs=[mem_table, mem_ids_state, mem_status, last_query_state])
     mem_table.select(on_mem_select, inputs=[mem_ids_state],
                      outputs=[m_title, m_type, m_tags, m_content, sel_mem_state])
 
@@ -458,6 +517,11 @@ def build_memory_tab() -> None:
 # ====================================================================== #
 def _provider_choices_for_qa() -> List[Tuple[str, str]]:
     out = [("(no LLM — extractive answers only)", "")]
+    if not _ensure_provider_store():
+        # Provider profiles just aren't offered — the QA tab itself stays
+        # usable via the extractive fallback; only the memory store is a
+        # hard dependency for this tab.
+        return out
     try:
         for p in _provider_store.list_profiles(public=True):
             # Ollama is the one provider get_llm_model() doesn't require a
@@ -479,6 +543,9 @@ def _build_llm_for_profile(profile_id: str):
     """
     if not profile_id:
         return None, ""
+    if not _ensure_provider_store():
+        return None, _err(f"Provider store unavailable ({_provider_init_error}); "
+                          f"using extractive fallback instead.")
     try:
         profile = _provider_store.get_profile(profile_id)
         llm = get_llm_model(profile.provider, **build_llm_kwargs(profile))
@@ -491,9 +558,14 @@ def _build_llm_for_profile(profile_id: str):
 
 
 def build_qa_tab() -> None:
-    if not _ensure_stores():
+    # The memory store is a hard dependency (there's nothing to answer
+    # questions from without it); the provider store is not — see
+    # _provider_choices_for_qa()/_build_llm_for_profile(), which each
+    # degrade to "no LLM" on their own if it's unavailable, so its failure
+    # doesn't need to disable this whole tab.
+    if not _ensure_memory_store():
         gr.Markdown(f"### 🤖 Agentic Q&A\n⚠️ Unavailable: local storage for this "
-                   f"feature could not be initialized ({_init_error}).")
+                   f"feature could not be initialized ({_memory_init_error}).")
         return
     gr.Markdown(
         "### 🤖 Agentic Q&A\n"

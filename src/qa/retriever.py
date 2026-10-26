@@ -117,18 +117,29 @@ class Retriever:
 
         scored: List[QASource] = []
         for mem in pool.values():
-            full_text = f"{mem.title} {mem.content} {' '.join(mem.tags)}"
+            # Newline-separated, matching store.search()'s own separator —
+            # joining with plain spaces could let a substring match span the
+            # title/content boundary (e.g. title ending "...foo" + content
+            # starting "bar..." reading as "foobar") that wouldn't have
+            # matched either field on its own.
+            full_text = f"{mem.title}\n{mem.content}\n{' '.join(mem.tags)}"
             h_set = set(tokenize(full_text))
             if not h_set:
                 continue
             overlap = q_set & h_set
-            is_substring_hit = bool(needle) and needle in full_text.lower()
-            if not overlap and not is_substring_hit:
+            if not overlap:
+                # No tokenized evidence at all: in particular, this excludes
+                # a needle that only matches as a substring *inside* a
+                # larger token (e.g. query "cat" inside content
+                # "concatenate") — tokenize() never splits "concatenate"
+                # into "cat", so that's not real word-level evidence, only
+                # an accident of Python's `in` operator.
                 continue
+            is_substring_hit = bool(needle) and needle in full_text.lower()
             # Overlap ratio against the query (recall-oriented) with a small
             # title-match and exact-phrase-hit bonus.
             score = len(overlap) / max(len(q_set), 1)
-            if overlap and any(t in tokenize(mem.title) for t in overlap):
+            if any(t in tokenize(mem.title) for t in overlap):
                 score += 0.25
             if is_substring_hit:
                 score += 0.5
